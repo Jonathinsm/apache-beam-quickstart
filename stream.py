@@ -15,8 +15,10 @@
 import apache_beam as beam
 import argparse
 import re
+import json
 
-from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.transforms import window
 
 def main():
     parser = argparse.ArgumentParser(description='Fisr Pipeline')
@@ -41,27 +43,42 @@ def word_cleaning(word):
         word = word.replace(a,b)
     return word
 
+
 def run_pipeline(custom_args, beam_args):
     input = custom_args.input
     output = custom_args.output
     n_words = custom_args.n_words
 
+    table_schema = 'word:STRING, count:STRING'
+
     opts = PipelineOptions(beam_args)
+    opts.view_as(StandardOptions).streaming = True
 
     with beam.Pipeline(options=opts) as p:
-        lines = p | "Read File" >> beam.io.ReadFromText(input)
+        lines = (
+            p 
+            | "Read Message" >> beam.io.ReadFromPubSub(input).with_output_types(bytes)
+            | 'decode' >> beam.Map(lambda x: x.decode('utf-8')))
 
         results = (
             lines
             | "Split" >> beam.FlatMap(lambda linea: linea.split())
             | "Cleaning" >> beam.Map(word_cleaning)
+            | beam.WindowInto(window.FixedWindows(15,0))
             | "Count" >> beam.combiners.Count.PerElement()
-            | "Get top list" >> beam.combiners.Top.Of(n_words,key=lambda kv: kv[1])
-            | "Get top words" >> beam.FlatMap(lambda element: element)
-            | "Format" >> beam.Map(lambda element: "%s,%d" % (element[0],element[1]))
+            | "Format" >> beam.Map(lambda element: '{"word" : "%s", "count" : "%d"}' % (element[0],element[1]))
+            | "Convert to json" >> beam.Map(lambda record: json.loads(record))
+            #| beam.Map(print)
+            #| "Encode" >> beam.Map(lambda x: x.encode('utf-8')).with_output_types(bytes)
         )
 
-        results | "Write file" >> beam.io.WriteToText(output)
+        results | "Write Result" >> beam.io.WriteToBigQuery(
+            output,
+            method='STREAMING_INSERTS',
+            schema=table_schema,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+            )
 
 if __name__ == '__main__':
     main()
